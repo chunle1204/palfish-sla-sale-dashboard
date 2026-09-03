@@ -236,6 +236,43 @@ def load_kpi(start: dt.date, end: dt.date, sales: tuple[str, ...] | None = None)
 
 
 @st.cache_data(ttl=600)
+def load_trend(
+    mn: dt.date, mx: dt.date, sales: tuple[str, ...] | None = None
+) -> pd.DataFrame:
+    """Xu huong cac chi so KPI chinh qua TUNG NGAY snapshot (day_update).
+    Luon lay TOAN BO lich su co san (mn..mx = get_day_range(), khong phai
+    khoang ngay dang chon o sidebar) - vi bo loc ngay o sidebar dung de chon
+    1 ngay xem KPI hien tai, con bieu do nay can nhieu ngay moi ve duoc
+    duong xu huong."""
+    client = bq_client()
+    filter_sql, filter_params = _sale_filter(sales)
+    q = f"""
+    SELECT
+      day_update,
+      COUNT(DISTINCT UID) AS uid_count,
+      APPROX_QUANTILES(Thoi_gian_L1_phut, 2)[OFFSET(1)] AS l1_median,
+      AVG(Is_Connect_cuoc_goi_dau_tien) * 100 AS connect_rate,
+      AVG(CASE WHEN Giai_doan_hien_tai = 'Mua hang thanh cong'
+               THEN 100.0 ELSE 0 END) AS purchase_rate,
+      AVG(CASE WHEN Phan_loai_cuoc_goi_cuoi = 'Chua tung goi'
+               THEN 100.0 ELSE 0 END) AS never_called_rate
+    FROM `{TABLE}`
+    WHERE day_update BETWEEN @mn AND @mx
+      {filter_sql}
+    GROUP BY 1
+    ORDER BY 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("mn", "DATE", mn),
+            bigquery.ScalarQueryParameter("mx", "DATE", mx),
+        ]
+        + filter_params
+    )
+    return client.query(q, job_config=job_config).result().to_dataframe()
+
+
+@st.cache_data(ttl=600)
 def load_stage_time(
     start: dt.date, end: dt.date, sales: tuple[str, ...] | None = None
 ) -> pd.DataFrame:
@@ -533,9 +570,59 @@ with tab_tong_quan:
     st.caption("→ Xem vì sao khó kết nối tại tab **Chất lượng cuộc gọi**.")
 
     st.divider()
+    st.markdown("#### 📈 Xu hướng theo ngày")
+    df_trend = load_trend(mn_day, mx_day, selected_sales)
+    if len(df_trend) < 2:
+        st.info(
+            "Mới có dữ liệu của **1 ngày snapshot** — biểu đồ xu hướng sẽ hiện "
+            "rõ dần khi hệ thống chạy tích lũy thêm nhiều ngày."
+        )
+    trend_left, trend_right = st.columns(2)
+    with trend_left:
+        st.markdown("**Tỷ lệ (%)**")
+        fig_t1 = go.Figure()
+        for col_name, label, color_key in [
+            ("purchase_rate", "Tỷ lệ mua hàng", "green"),
+            ("connect_rate", "Tỷ lệ kết nối cuộc gọi đầu", "blue"),
+            ("never_called_rate", "Tỷ lệ chưa từng gọi", "red"),
+        ]:
+            fig_t1.add_trace(go.Scatter(
+                x=df_trend["day_update"], y=df_trend[col_name],
+                mode="lines+markers", name=label,
+                line=dict(color=COLORS[color_key]["accent"]),
+            ))
+        apply_dark_layout(
+            fig_t1, height=320, yaxis_title="%",
+            legend=dict(orientation="h", y=-0.2),
+        )
+        st.plotly_chart(fig_t1, use_container_width=True)
+
+    with trend_right:
+        st.markdown("**L1 · Trung vị (phút) & khối lượng UID**")
+        fig_t2 = go.Figure()
+        fig_t2.add_trace(go.Bar(
+            x=df_trend["day_update"], y=df_trend["uid_count"],
+            name="Số UID", marker=dict(color=COLORS["gray"]["accent"], opacity=0.5),
+            yaxis="y2",
+        ))
+        fig_t2.add_trace(go.Scatter(
+            x=df_trend["day_update"], y=df_trend["l1_median"],
+            mode="lines+markers", name="L1 trung vị (phút)",
+            line=dict(color=COLORS["peach"]["accent"]),
+        ))
+        apply_dark_layout(
+            fig_t2, height=320,
+            yaxis=dict(title="L1 (phút)"),
+            yaxis2=dict(title="Số UID", overlaying="y", side="right", showgrid=False),
+            legend=dict(orientation="h", y=-0.2),
+        )
+        st.plotly_chart(fig_t2, use_container_width=True)
+
     st.caption(
-        "💡 Mẹo: đổi khoảng ngày ở thanh bên trái để xem lại lịch sử snapshot "
-        "các ngày trước."
+        "💡 Biểu đồ xu hướng luôn lấy TOÀN BỘ lịch sử snapshot đang có "
+        f"({mn_day} → {mx_day}), không bị giới hạn bởi bộ lọc ngày ở "
+        "thanh bên trái (bộ lọc đó chỉ dùng để chọn 1 ngày xem KPI hiện tại "
+        "ở phía trên)."
     )
 
 # --------------------------------------------------------------------------
