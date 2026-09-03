@@ -113,24 +113,6 @@ st.set_page_config(
 )
 
 # --------------------------------------------------------------------------
-# CSS - toi gian, chi chinh tieu de section (theme toi da lay tu config.toml)
-# --------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-    .section-title {
-        font-size: 1.05rem;
-        font-weight: 700;
-        color: #D8DCE0;
-        margin: 4px 0 14px 0;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# --------------------------------------------------------------------------
 # BigQuery helpers
 # --------------------------------------------------------------------------
 @st.cache_resource
@@ -560,15 +542,6 @@ with tab_tong_quan:
 # Tab: Diem nghen
 # --------------------------------------------------------------------------
 with tab_diem_nghen:
-    l1_text = f"{kpi['l1_median']:,.0f} phút" if kpi["l1_median"] is not None else "—"
-    st.markdown(
-        f'<div class="section-title">Ở tab Tổng quan, L1 trung vị là '
-        f'<b>{l1_text}</b> — tab này so sánh thời gian xử lý &amp; khối lượng '
-        "theo từng chặng để biết CHÍNH XÁC khâu nào đang là điểm nghẽn cần ưu "
-        "tiên xử lý.</div>",
-        unsafe_allow_html=True,
-    )
-
     with st.expander("📋 Quy trình xử lý lead của Sale (định nghĩa từng mốc)"):
         for code, en, vi in LEAD_STAGE_DEFS:
             st.markdown(f"**{code}** — {en}: {vi}")
@@ -653,17 +626,6 @@ with tab_diem_nghen:
 # Tab: Hieu suat theo Sale
 # --------------------------------------------------------------------------
 with tab_sale:
-    purchase_text = (
-        f"{kpi['purchase_rate']:.0f}%" if kpi["purchase_rate"] is not None else "—"
-    )
-    st.markdown(
-        f'<div class="section-title">Ở tab Tổng quan, tỷ lệ mua hàng chung là '
-        f'<b>{purchase_text}</b> trên <b>{kpi["active_sales"]}</b> sale — tab '
-        "này bẻ số liệu đó ra theo từng sale để biết vấn đề là chung cho cả "
-        "đội, hay chỉ tập trung ở vài sale/nhóm.</div>",
-        unsafe_allow_html=True,
-    )
-
     df_sale = load_sale_performance(start_date, end_date, selected_sales)
 
     col_left, col_right = st.columns(2)
@@ -778,21 +740,6 @@ with tab_sale:
 # Tab: Chat luong cuoc goi
 # --------------------------------------------------------------------------
 with tab_call:
-    connect_text = (
-        f"{kpi['connect_rate']:.0f}%" if kpi["connect_rate"] is not None else "—"
-    )
-    never_text = (
-        f"{kpi['never_called_rate']:.0f}%"
-        if kpi["never_called_rate"] is not None else "—"
-    )
-    st.markdown(
-        f'<div class="section-title">Ở tab Tổng quan, tỷ lệ kết nối cuộc gọi '
-        f'đầu là <b>{connect_text}</b> và tỷ lệ chưa từng gọi là '
-        f'<b>{never_text}</b> — tab này đào sâu nguyên nhân: khó liên lạc '
-        "được khách hay liên lạc được nhưng xử lý chậm?</div>",
-        unsafe_allow_html=True,
-    )
-
     cq = load_call_quality(start_date, end_date, selected_sales)
 
     row1 = st.columns(3)
