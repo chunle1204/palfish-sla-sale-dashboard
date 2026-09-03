@@ -251,6 +251,7 @@ def load_trend(
       day_update,
       COUNT(DISTINCT UID) AS uid_count,
       APPROX_QUANTILES(Thoi_gian_L1_phut, 2)[OFFSET(1)] AS l1_median,
+      APPROX_QUANTILES(Thoi_gian_L5_phut, 2)[OFFSET(1)] AS l5_median,
       AVG(Is_Connect_cuoc_goi_dau_tien) * 100 AS connect_rate,
       AVG(CASE WHEN Giai_doan_hien_tai = 'Mua hang thanh cong'
                THEN 100.0 ELSE 0 END) AS purchase_rate,
@@ -598,7 +599,7 @@ with tab_tong_quan:
         st.plotly_chart(fig_t1, use_container_width=True)
 
     with trend_right:
-        st.markdown("**L1 · Trung vị (phút) & khối lượng UID**")
+        st.markdown("**L1 & L5 · Trung vị (phút) & khối lượng UID**")
         fig_t2 = go.Figure()
         fig_t2.add_trace(go.Bar(
             x=df_trend["day_update"], y=df_trend["uid_count"],
@@ -607,19 +608,28 @@ with tab_tong_quan:
         ))
         fig_t2.add_trace(go.Scatter(
             x=df_trend["day_update"], y=df_trend["l1_median"],
-            mode="lines+markers", name="L1 trung vị (phút)",
+            mode="lines+markers", name="L1 · Chia lead → gọi đầu (phút)",
             line=dict(color=COLORS["peach"]["accent"]),
+        ))
+        fig_t2.add_trace(go.Scatter(
+            x=df_trend["day_update"], y=df_trend["l5_median"],
+            mode="lines+markers", name="L5 · Học thử xong → tư vấn (phút)",
+            line=dict(color=COLORS["purple"]["accent"]),
         ))
         apply_dark_layout(
             fig_t2, height=320,
-            yaxis=dict(title="L1 (phút)"),
+            yaxis=dict(title="Phút"),
             yaxis2=dict(title="Số UID", overlaying="y", side="right", showgrid=False),
             legend=dict(orientation="h", y=-0.2),
         )
         st.plotly_chart(fig_t2, use_container_width=True)
 
     st.caption(
-        "💡 Biểu đồ xu hướng luôn lấy TOÀN BỘ lịch sử snapshot đang có "
+        "💡 Chỉ theo dõi L1 & L5 — đây là 2 mốc thời gian nằm trong tầm kiểm "
+        "soát của Sale (tốc độ phản hồi đầu tiên, và tốc độ theo sát khách "
+        "ngay sau buổi học thử) và có đủ dữ liệu để tin cậy. Các mốc L3.1/L4 "
+        "hiện gần như trống do lỗi dữ liệu nguồn nên chưa đưa vào đây. Biểu "
+        "đồ luôn lấy TOÀN BỘ lịch sử snapshot đang có "
         f"({mn_day} → {mx_day}), không bị giới hạn bởi bộ lọc ngày ở "
         "thanh bên trái (bộ lọc đó chỉ dùng để chọn 1 ngày xem KPI hiện tại "
         "ở phía trên)."
