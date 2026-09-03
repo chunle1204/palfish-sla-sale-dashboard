@@ -18,11 +18,13 @@ Muc tieu dashboard: theo doi toc do xu ly lead cua Sale, xac dinh SLA dang
 nghen o buoc nao va nghen tap trung o Sale nao, tu do tim nguyen nhan de cai
 thien ty le tiep can va chuyen doi.
 
-Cấu trúc 4 tab:
-  1. Tong quan            - buc tranh chung hom nay the nao? (muc luc)
-  2. Diem nghen            - van de nam o khau nao trong hanh trinh?
+Cấu trúc 5 tab:
+  1. Tong quan            - buc tranh chung + xu huong theo ngay
+  2. Diem nghen            - van de nam o khau nao? cat lat theo Sale/depart,
+                             tra cuu hanh trinh 1 UID cu the
   3. Hieu suat theo Sale    - van de la cua ai?
   4. Chat luong cuoc goi    - vi sao lai cham/nghen?
+  5. Bao cao dinh ky       - tu sinh ban tom tat markdown, tai ve duoc
 
 Chay app:
     streamlit run app.py
@@ -246,12 +248,14 @@ def load_trend(
     duong xu huong."""
     client = bq_client()
     filter_sql, filter_params = _sale_filter(sales)
+    stage_trend_cols_sql = ",\n      ".join(
+        f"APPROX_QUANTILES({col}, 2)[OFFSET(1)] AS {col}" for col, _ in STAGE_TIME_COLS
+    )
     q = f"""
     SELECT
       day_update,
       COUNT(DISTINCT UID) AS uid_count,
-      APPROX_QUANTILES(Thoi_gian_L1_phut, 2)[OFFSET(1)] AS l1_median,
-      APPROX_QUANTILES(Thoi_gian_L5_phut, 2)[OFFSET(1)] AS l5_median,
+      {stage_trend_cols_sql},
       AVG(Is_Connect_cuoc_goi_dau_tien) * 100 AS connect_rate,
       AVG(CASE WHEN Giai_doan_hien_tai = 'Mua hang thanh cong'
                THEN 100.0 ELSE 0 END) AS purchase_rate,
@@ -452,6 +456,161 @@ def load_call_quality(
     return kpi
 
 
+# Cac chieu duoc phep "cat lat" o tab Diem nghen - CHI liet ke o day (khong
+# nhan ten cot truc tiep tu UI) de tranh dua chuoi tuy y nguoi dung vao SQL.
+BREAKDOWN_DIMS = {
+    "Theo Sale (chia lead)": "Sale_Name_chia_lead",
+    "Theo bộ phận depart6": "Current_Sale_depart6_name_chia_lead",
+    "Theo bộ phận depart7": "Current_Sale_depart7_name_chia_lead",
+}
+
+
+@st.cache_data(ttl=600)
+def load_stage_time_by_group(
+    start: dt.date, end: dt.date, group_col: str,
+    sales: tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    """Thoi gian trung vi L1 & L5 (2 moc tin cay nhat - xem trao doi
+    03/09/2026) be theo 1 chieu nhom (Sale hoac depart6/7), gop cac nhom
+    nho (n<5) vao 'Khac' de bieu do khong bi vun."""
+    client = bq_client()
+    filter_sql, filter_params = _sale_filter(sales)
+    q = f"""
+    SELECT
+      COALESCE({group_col}, 'Không xác định') AS nhom,
+      COUNT(DISTINCT UID) AS n,
+      APPROX_QUANTILES(Thoi_gian_L1_phut, 2)[OFFSET(1)] AS l1_median,
+      APPROX_QUANTILES(Thoi_gian_L5_phut, 2)[OFFSET(1)] AS l5_median
+    FROM `{TABLE}`
+    WHERE day_update BETWEEN @start AND @end
+      {filter_sql}
+    GROUP BY 1
+    ORDER BY n DESC
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("start", "DATE", start),
+            bigquery.ScalarQueryParameter("end", "DATE", end),
+        ]
+        + filter_params
+    )
+    return client.query(q, job_config=job_config).result().to_dataframe()
+
+
+def bao_cao_dinh_ky(
+    kpi: dict, df_time: pd.DataFrame, df_vol: pd.DataFrame,
+    canh_bao: pd.DataFrame, workload_threshold: float, avg_purchase: float,
+    cq: dict, start: dt.date, end: dt.date, sales: tuple[str, ...] | None,
+) -> str:
+    """Sinh ban tom tat markdown TU DUNG du lieu dang loc (khoang ngay + ten
+    sale o sidebar) - de tai ve gui team/anh Hieu ma khong can tu go tay lai
+    so lieu. Doc theo tab Bao cao dinh ky."""
+    pham_vi = f"{start} → {end}" if start != end else f"{start}"
+    loc_sale = f"lọc theo sale: {', '.join(sales)}" if sales else "tất cả sale"
+
+    cham_nhat = df_time.dropna(subset=["Trung vị (phút)"]).sort_values(
+        "Trung vị (phút)", ascending=False
+    )
+    dong_nhat = df_vol.sort_values("so_uid", ascending=False)
+
+    lines = [
+        f"# Báo cáo SLA Sale — PalFish ({dt.date.today():%d/%m/%Y})",
+        "",
+        f"Phạm vi dữ liệu: **{pham_vi}** · {loc_sale}",
+        "",
+        "## Chỉ số chính",
+        "- UID đang được chăm sóc: "
+        f"**{kpi['uid_count']:,}**".replace(",", "."),
+        (
+            f"- L1 trung vị (chia lead → gọi đầu): **{kpi['l1_median']:.0f} phút**"
+            if kpi["l1_median"] is not None else "- L1 trung vị: —"
+        ),
+        (
+            f"- Tỷ lệ mua hàng thành công: **{kpi['purchase_rate']:.0f}%**"
+            if kpi["purchase_rate"] is not None else "- Tỷ lệ mua hàng: —"
+        ),
+        (
+            f"- Tỷ lệ kết nối cuộc gọi đầu: **{kpi['connect_rate']:.0f}%**"
+            if kpi["connect_rate"] is not None else "- Tỷ lệ kết nối: —"
+        ),
+        (
+            f"- Tỷ lệ chưa từng gọi: **{kpi['never_called_rate']:.0f}%**"
+            if kpi["never_called_rate"] is not None else "- Tỷ lệ chưa từng gọi: —"
+        ),
+        f"- Số sale đang hoạt động: **{kpi['active_sales']:,}**",
+        "",
+        "## Điểm nghẽn",
+    ]
+    if not cham_nhat.empty:
+        r0 = cham_nhat.iloc[0]
+        lines.append(
+            f"- Chặng chậm nhất: **{r0['Chặng']}** — {r0['Trung vị (phút)']:.0f} "
+            f"phút (n={r0['n']})"
+        )
+    if not dong_nhat.empty:
+        r1 = dong_nhat.iloc[0]
+        lines.append(
+            f"- Trạng thái lead tồn nhiều nhất: **{r1['giai_doan']}** — "
+            f"{r1['so_uid']:,} UID".replace(",", ".")
+        )
+    lines += ["", "## Sale cần chú ý"]
+    if len(canh_bao) > 0:
+        lines.append(
+            f"{len(canh_bao)} sale vừa khối lượng cao (≥{workload_threshold:.0f} "
+            f"UID) vừa tỷ lệ mua hàng dưới TB chung ({avg_purchase:.0f}%):"
+        )
+        for _, row in canh_bao.head(10).iterrows():
+            lines.append(
+                f"- {row['sale']} — {row['so_uid']:.0f} UID, tỷ lệ mua hàng "
+                f"{row['ty_le_mua_hang']:.0f}%"
+            )
+    else:
+        lines.append("- Không có sale nào vượt ngưỡng cảnh báo.")
+
+    lines += [
+        "",
+        "## Chất lượng cuộc gọi",
+        (
+            f"- Tỷ lệ kết nối cuộc gọi đầu: {cq['ty_le_ket_noi']:.0f}%"
+            if cq["ty_le_ket_noi"] is not None else "- Tỷ lệ kết nối: —"
+        ),
+        (
+            f"- Chưa từng kết nối dù gọi nhiều lần: "
+            f"{cq['ty_le_chua_tung_ket_noi']:.0f}%"
+            if cq["ty_le_chua_tung_ket_noi"] is not None else "- —"
+        ),
+        "",
+        "## Ghi chú dữ liệu",
+        "- L3.1 và L4 hiện gần như không có dữ liệu do lỗi dữ liệu nguồn "
+        "(Metabase) — chưa dùng được để đánh giá.",
+        "- Số UID theo giai đoạn đang dùng tạm `Status_of_Lead` (CRM) thay cho "
+        "`Giai_doan_hien_tai` (đang có case lệch vòng khi UID mua rồi lại có "
+        "mốc mới).",
+        "",
+        "## Việc cần làm tiếp theo",
+        "- …",
+    ]
+    return "\n".join(lines)
+
+
+@st.cache_data(ttl=600)
+def load_uid_detail(uid: str) -> pd.DataFrame:
+    """Tra ve 1 dong day du cho 1 UID cu the (snapshot moi nhat) de ve
+    timeline hanh trinh xu ly lead - dung cho muc tra cuu o tab Diem nghen."""
+    client = bq_client()
+    q = f"""
+    SELECT *
+    FROM `{TABLE}`
+    WHERE UID = @uid
+    ORDER BY day_update DESC
+    LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("uid", "STRING", uid)]
+    )
+    return client.query(q, job_config=job_config).result().to_dataframe()
+
+
 # --------------------------------------------------------------------------
 # UI helpers
 # --------------------------------------------------------------------------
@@ -523,12 +682,13 @@ render_header()
 # vao phan tich).
 kpi = load_kpi(start_date, end_date, selected_sales)
 
-tab_tong_quan, tab_diem_nghen, tab_sale, tab_call = st.tabs(
+tab_tong_quan, tab_diem_nghen, tab_sale, tab_call, tab_bao_cao = st.tabs(
     [
         "Tổng quan",
         "Điểm nghẽn",
         "Hiệu suất theo Sale",
         "Chất lượng cuộc gọi",
+        "Báo cáo định kỳ",
     ]
 )
 
@@ -599,40 +759,37 @@ with tab_tong_quan:
         st.plotly_chart(fig_t1, use_container_width=True)
 
     with trend_right:
-        st.markdown("**L1 & L5 · Trung vị (phút) & khối lượng UID**")
+        st.markdown("**Trung vị từng chặng L1→L8 (phút) & khối lượng UID**")
         fig_t2 = go.Figure()
         fig_t2.add_trace(go.Bar(
             x=df_trend["day_update"], y=df_trend["uid_count"],
-            name="Số UID", marker=dict(color=COLORS["gray"]["accent"], opacity=0.5),
+            name="Số UID", marker=dict(color=COLORS["gray"]["accent"], opacity=0.4),
             yaxis="y2",
         ))
-        fig_t2.add_trace(go.Scatter(
-            x=df_trend["day_update"], y=df_trend["l1_median"],
-            mode="lines+markers", name="L1 · Chia lead → gọi đầu (phút)",
-            line=dict(color=COLORS["peach"]["accent"]),
-        ))
-        fig_t2.add_trace(go.Scatter(
-            x=df_trend["day_update"], y=df_trend["l5_median"],
-            mode="lines+markers", name="L5 · Học thử xong → tư vấn (phút)",
-            line=dict(color=COLORS["purple"]["accent"]),
-        ))
+        stage_trend_colors = ["peach", "yellow", "green", "purple", "red"]
+        for (col_name, label), color_key in zip(STAGE_TIME_COLS, stage_trend_colors):
+            fig_t2.add_trace(go.Scatter(
+                x=df_trend["day_update"], y=df_trend[col_name],
+                mode="lines+markers", name=label,
+                line=dict(color=COLORS[color_key]["accent"]),
+                connectgaps=False,
+            ))
         apply_dark_layout(
-            fig_t2, height=320,
+            fig_t2, height=340,
             yaxis=dict(title="Phút"),
             yaxis2=dict(title="Số UID", overlaying="y", side="right", showgrid=False),
-            legend=dict(orientation="h", y=-0.2),
+            legend=dict(orientation="h", y=-0.35),
         )
         st.plotly_chart(fig_t2, use_container_width=True)
 
     st.caption(
-        "💡 Chỉ theo dõi L1 & L5 — đây là 2 mốc thời gian nằm trong tầm kiểm "
-        "soát của Sale (tốc độ phản hồi đầu tiên, và tốc độ theo sát khách "
-        "ngay sau buổi học thử) và có đủ dữ liệu để tin cậy. Các mốc L3.1/L4 "
-        "hiện gần như trống do lỗi dữ liệu nguồn nên chưa đưa vào đây. Biểu "
-        "đồ luôn lấy TOÀN BỘ lịch sử snapshot đang có "
-        f"({mn_day} → {mx_day}), không bị giới hạn bởi bộ lọc ngày ở "
-        "thanh bên trái (bộ lọc đó chỉ dùng để chọn 1 ngày xem KPI hiện tại "
-        "ở phía trên)."
+        "💡 Hiện đủ cả 5 chặng L1→L8 để có bức tranh tổng quan. Lưu ý: "
+        "**L3.1 và L4 hiện gần như không có dữ liệu** (lỗi dữ liệu nguồn từ "
+        "Metabase, đã biết nguyên nhân) nên 2 đường này có thể đứt quãng hoặc "
+        "không hiện — không phải app bị lỗi. Biểu đồ luôn lấy TOÀN BỘ lịch sử "
+        f"snapshot đang có ({mn_day} → {mx_day}), không bị giới hạn bởi bộ lọc "
+        "ngày ở thanh bên trái (bộ lọc đó chỉ dùng để chọn 1 ngày xem KPI hiện "
+        "tại ở phía trên)."
     )
 
 # --------------------------------------------------------------------------
@@ -718,6 +875,101 @@ with tab_diem_nghen:
         "nào vừa xử lý chậm (bên trái) vừa có nhiều UID đang đứng ở đó (bên "
         "phải) → khâu đó đang ùn ứ, cần ưu tiên xử lý."
     )
+
+    st.divider()
+    st.markdown("#### 🔎 Cắt lát L1 & L5 theo nhóm")
+    dim_label = st.radio(
+        "Xem theo", options=list(BREAKDOWN_DIMS.keys()), horizontal=True,
+        key="breakdown_dim",
+    )
+    df_group = load_stage_time_by_group(
+        start_date, end_date, BREAKDOWN_DIMS[dim_label], selected_sales
+    )
+    # Gop cac nhom qua nho (n<5) vao "Khac" de bieu do khong bi vun vat —
+    # van giu top 20 nhom lon nhat rieng.
+    df_group_top = df_group.head(20).copy()
+    fig_group = go.Figure()
+    fig_group.add_trace(go.Bar(
+        y=df_group_top["nhom"], x=df_group_top["l1_median"],
+        orientation="h", name="L1 trung vị (phút)",
+        marker=dict(color=COLORS["peach"]["accent"]),
+    ))
+    fig_group.add_trace(go.Bar(
+        y=df_group_top["nhom"], x=df_group_top["l5_median"],
+        orientation="h", name="L5 trung vị (phút)",
+        marker=dict(color=COLORS["purple"]["accent"]),
+    ))
+    apply_dark_layout(
+        fig_group, height=max(320, 30 * len(df_group_top)),
+        barmode="group",
+        yaxis=dict(autorange="reversed"),
+        xaxis_title="Phút",
+        legend=dict(orientation="h", y=-0.15),
+    )
+    st.plotly_chart(fig_group, use_container_width=True)
+    st.caption(
+        f"📋 Đang hiện top {len(df_group_top)}/{len(df_group)} nhóm theo "
+        f"**{dim_label}** (sắp theo số UID giảm dần). Nhóm nào cột dài bất "
+        "thường so với phần còn lại là nơi đáng kiểm tra trước."
+    )
+
+    st.divider()
+    st.markdown("#### 🔍 Tra cứu hành trình 1 UID cụ thể")
+    uid_input = st.text_input(
+        "Nhập UID (copy nguyên văn từ CRM/Metabase)", key="uid_lookup"
+    ).strip()
+    if uid_input:
+        df_uid = load_uid_detail(uid_input)
+        if df_uid.empty:
+            st.warning(f"Không tìm thấy UID `{uid_input}` trong dữ liệu.")
+        else:
+            r = df_uid.iloc[0]
+
+            def _s(v):
+                """Chuan hoa 1 gia tri tu dataframe 1-dong: None/NaN/chuoi
+                rong -> None (BigQuery tra NULL cua dong DUY NHAT thanh
+                float NaN thay vi None khi to_dataframe() suy dtype, nen
+                khong the chi dung "if v" / "v or ..." nhu binh thuong)."""
+                if v is None or v == "" or (isinstance(v, float) and pd.isna(v)):
+                    return None
+                return v
+
+            st.markdown(
+                f"**Sale hiện tại:** {_s(r['Current_Sale_Name_chia_lead']) or '—'} "
+                f"· **Sale lúc chia lead:** {_s(r['Sale_Name_chia_lead']) or '—'} · "
+                f"**Trạng thái (CRM):** {_s(r['Status_of_Lead']) or '—'} · "
+                f"**Giai đoạn hiện tại:** {_s(r['Giai_doan_hien_tai']) or '—'}"
+            )
+            timeline = [
+                ("Chia lead", r["Thoi_gian_chia_lead"]),
+                ("Cuộc gọi đầu tiên", r["Thoi_gian_cuoc_goi_dau_tien"]),
+                ("Hẹn lịch học thử", r["Appoint_lesson_Time"]),
+                ("Hoàn thành học thử gần nhất", r["Day_finished_the_trial_class_lastest"]),
+                ("Cuộc gọi tư vấn lộ trình", r["Thoi_gian_cuoc_goi_tu_van_lo_trinh"]),
+                ("Mua hàng", r["Purchase_Time"]),
+            ]
+            for label, ts in timeline:
+                ts = _s(ts)
+                if ts:
+                    st.markdown(f"- **{label}**: {ts}")
+                else:
+                    st.markdown(f"- {label}: _chưa có_")
+
+            st.markdown("**Thời gian mỗi chặng (phút):**")
+            lcols = st.columns(5)
+            for c, (col_name, label) in zip(lcols, STAGE_TIME_COLS):
+                v = r[col_name]
+                c.metric(label.split("·")[0].strip(), f"{v:,.0f}" if pd.notna(v) else "—")
+
+            if _s(r["Purchase_Time"]):
+                gia = f"{int(r['Order_Price_VND']):,}".replace(",", ".") if pd.notna(r["Order_Price_VND"]) else "—"
+                st.success(f"✅ Đã mua: **{_s(r['Package_Name']) or '(không rõ gói)'}** — {gia} VND")
+            if pd.notna(r["So_cuoc_goi_trong_ngay"]) or pd.notna(r["Tong_so_cuoc_goi_den_khi_nghe_may"]):
+                st.caption(
+                    f"📞 Phân loại cuộc gọi cuối: {_s(r['Phan_loai_cuoc_goi_cuoi']) or '—'} · "
+                    f"Kết nối ngay lần đầu: "
+                    f"{'Có' if r['Is_Connect_cuoc_goi_dau_tien'] == 1 else 'Không'}"
+                )
 
 # --------------------------------------------------------------------------
 # Tab: Hieu suat theo Sale
@@ -881,4 +1133,26 @@ with tab_call:
         "máy) hoặc cột **Chưa từng kết nối** (đỏ) càng cao → càng khó tiếp "
         "cận khách, có thể do sai số điện thoại, khách không nghe máy lạ, "
         "hoặc thời điểm gọi chưa phù hợp."
+    )
+
+# --------------------------------------------------------------------------
+# Tab: Bao cao dinh ky - tu sinh ban tom tat markdown TU DUNG du lieu dang
+# loc, tai ve duoc, khong can tu go tay so lieu moi lan bao cao team.
+# --------------------------------------------------------------------------
+with tab_bao_cao:
+    st.markdown(
+        "Bản tóm tắt dưới đây tự sinh từ **đúng dữ liệu đang lọc** ở thanh "
+        "bên trái (khoảng ngày + tên sale) — tải về gửi team/anh Hiếu, hoặc "
+        "copy dán thẳng vào chat, không cần tự gõ tay lại số liệu."
+    )
+    txt_bao_cao = bao_cao_dinh_ky(
+        kpi, df_time, df_vol, canh_bao, workload_threshold, avg_purchase,
+        cq, start_date, end_date, selected_sales,
+    )
+    st.code(txt_bao_cao, language="markdown")
+    st.download_button(
+        "📥 Tải bản .md",
+        data=txt_bao_cao.encode("utf-8"),
+        file_name=f"bao-cao-SLA-Sale-{dt.date.today():%Y%m%d}.md",
+        mime="text/markdown",
     )
