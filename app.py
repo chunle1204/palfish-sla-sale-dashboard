@@ -164,8 +164,43 @@ def get_day_range() -> tuple[dt.date, dt.date]:
 
 
 @st.cache_data(ttl=600)
-def load_kpi(start: dt.date, end: dt.date) -> dict:
+def load_sale_list(start: dt.date, end: dt.date) -> list[str]:
+    """Danh sach ten sale (Sale_Name_chia_lead) de hien thi trong bo loc
+    sidebar. Dung dung cot nay (khong phai Current_Binded_Sale) de khop voi
+    cach cac bieu do khac dang gan trach nhiem SLA cho sale."""
     client = bq_client()
+    q = f"""
+    SELECT DISTINCT Sale_Name_chia_lead AS sale
+    FROM `{TABLE}`
+    WHERE day_update BETWEEN @start AND @end
+      AND Sale_Name_chia_lead IS NOT NULL
+    ORDER BY 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("start", "DATE", start),
+            bigquery.ScalarQueryParameter("end", "DATE", end),
+        ]
+    )
+    df = client.query(q, job_config=job_config).result().to_dataframe()
+    return df["sale"].tolist()
+
+
+def _sale_filter(sales: tuple[str, ...] | None):
+    """Sinh ra doan SQL + query param de loc theo Sale_Name_chia_lead khi
+    nguoi dung chon bo loc sale o sidebar. Tra ve chuoi rong + list rong neu
+    khong loc gi (chon tat ca)."""
+    if not sales:
+        return "", []
+    return "AND Sale_Name_chia_lead IN UNNEST(@sales)", [
+        bigquery.ArrayQueryParameter("sales", "STRING", list(sales))
+    ]
+
+
+@st.cache_data(ttl=600)
+def load_kpi(start: dt.date, end: dt.date, sales: tuple[str, ...] | None = None) -> dict:
+    client = bq_client()
+    filter_sql, filter_params = _sale_filter(sales)
     q = f"""
     WITH base AS (
       SELECT
@@ -178,6 +213,7 @@ def load_kpi(start: dt.date, end: dt.date) -> dict:
         ) AS phut_hoan_thanh_cham_soc
       FROM `{TABLE}`
       WHERE day_update BETWEEN @start AND @end
+        {filter_sql}
     )
     SELECT
       COUNT(DISTINCT UID) AS uid_count,
@@ -207,6 +243,7 @@ def load_kpi(start: dt.date, end: dt.date) -> dict:
             bigquery.ScalarQueryParameter("start", "DATE", start),
             bigquery.ScalarQueryParameter("end", "DATE", end),
         ]
+        + filter_params
     )
     row = list(client.query(q, job_config=job_config).result())[0]
     kpi = dict(row.items())
@@ -217,8 +254,11 @@ def load_kpi(start: dt.date, end: dt.date) -> dict:
 
 
 @st.cache_data(ttl=600)
-def load_stage_time(start: dt.date, end: dt.date) -> pd.DataFrame:
+def load_stage_time(
+    start: dt.date, end: dt.date, sales: tuple[str, ...] | None = None
+) -> pd.DataFrame:
     client = bq_client()
+    filter_sql, filter_params = _sale_filter(sales)
     cols_sql = ",\n      ".join(
         f"APPROX_QUANTILES({col}, 2)[OFFSET(1)] AS {col}" for col, _ in STAGE_TIME_COLS
     )
@@ -231,12 +271,14 @@ def load_stage_time(start: dt.date, end: dt.date) -> pd.DataFrame:
       {n_sql}
     FROM `{TABLE}`
     WHERE day_update BETWEEN @start AND @end
+      {filter_sql}
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("start", "DATE", start),
             bigquery.ScalarQueryParameter("end", "DATE", end),
         ]
+        + filter_params
     )
     row = list(client.query(q, job_config=job_config).result())[0]
     records = [
@@ -247,18 +289,22 @@ def load_stage_time(start: dt.date, end: dt.date) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
-def load_stage_volume(start: dt.date, end: dt.date) -> pd.DataFrame:
+def load_stage_volume(
+    start: dt.date, end: dt.date, sales: tuple[str, ...] | None = None
+) -> pd.DataFrame:
     """Phan bo UID theo Status_of_Lead - trang thai CHINH THUC tu CRM (khop
     dung so do L1-L8 chuan cua quy trinh), dung TAM THOI thay cho
     Giai_doan_hien_tai (cot tu tinh trong noi bo, dang co van de "lech vong"
     khi UID da mua roi lai co moc moi - xem trao doi 03/09/2026)."""
     client = bq_client()
+    filter_sql, filter_params = _sale_filter(sales)
     q = f"""
     SELECT
       COALESCE(Status_of_Lead, 'Chưa xác định') AS giai_doan,
       COUNT(DISTINCT UID) AS so_uid
     FROM `{TABLE}`
     WHERE day_update BETWEEN @start AND @end
+      {filter_sql}
     GROUP BY 1
     """
     job_config = bigquery.QueryJobConfig(
@@ -266,6 +312,7 @@ def load_stage_volume(start: dt.date, end: dt.date) -> pd.DataFrame:
             bigquery.ScalarQueryParameter("start", "DATE", start),
             bigquery.ScalarQueryParameter("end", "DATE", end),
         ]
+        + filter_params
     )
     df = client.query(q, job_config=job_config).result().to_dataframe()
     df["order"] = df["giai_doan"].apply(
@@ -277,13 +324,16 @@ def load_stage_volume(start: dt.date, end: dt.date) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
-def load_sale_performance(start: dt.date, end: dt.date) -> pd.DataFrame:
+def load_sale_performance(
+    start: dt.date, end: dt.date, sales: tuple[str, ...] | None = None
+) -> pd.DataFrame:
     """Be so lieu theo tung sale (Sale_Name_chia_lead - sale da nhan lead DUNG LUC
     Thoi_gian_chia_lead, khong phai sale hien tai) - de biet diem nghen o trang
     'Diem nghen' co tap trung o vai sale cu the hay dong deu. Dung cot nay (thay vi
     Current_Binded_Sale) vi no khop dung sale chiu trach nhiem cho L1 (thoi gian
     phan hoi = Thoi_gian_cuoc_goi_dau_tien - Thoi_gian_chia_lead)."""
     client = bq_client()
+    filter_sql, filter_params = _sale_filter(sales)
     q = f"""
     SELECT
       COALESCE(Sale_Name_chia_lead, 'Chưa gán sale') AS sale,
@@ -296,6 +346,7 @@ def load_sale_performance(start: dt.date, end: dt.date) -> pd.DataFrame:
       APPROX_QUANTILES(Thoi_gian_L1_phut, 2)[OFFSET(1)] AS l1_median
     FROM `{TABLE}`
     WHERE day_update BETWEEN @start AND @end
+      {filter_sql}
     GROUP BY 1
     """
     job_config = bigquery.QueryJobConfig(
@@ -303,13 +354,16 @@ def load_sale_performance(start: dt.date, end: dt.date) -> pd.DataFrame:
             bigquery.ScalarQueryParameter("start", "DATE", start),
             bigquery.ScalarQueryParameter("end", "DATE", end),
         ]
+        + filter_params
     )
     df = client.query(q, job_config=job_config).result().to_dataframe()
     return df.sort_values("so_uid", ascending=False).reset_index(drop=True)
 
 
 @st.cache_data(ttl=600)
-def load_call_quality(start: dt.date, end: dt.date) -> dict:
+def load_call_quality(
+    start: dt.date, end: dt.date, sales: tuple[str, ...] | None = None
+) -> dict:
     """So lieu chat luong cuoc goi: ty le ket noi, so cuoc goi can de ket noi
     duoc, va phan bo so cuoc goi (histogram)."""
     # Tong_so_cuoc_goi_den_khi_nghe_may CHI co gia tri cho UID co cuoc goi DAU
@@ -326,6 +380,7 @@ def load_call_quality(start: dt.date, end: dt.date) -> dict:
       END
     """
     client = bq_client()
+    filter_sql, filter_params = _sale_filter(sales)
     q = f"""
     SELECT
       COUNT(DISTINCT UID) AS n_da_goi,
@@ -338,12 +393,14 @@ def load_call_quality(start: dt.date, end: dt.date) -> dict:
     FROM `{TABLE}`
     WHERE day_update BETWEEN @start AND @end
       AND Thoi_gian_cuoc_goi_dau_tien IS NOT NULL
+      {filter_sql}
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("start", "DATE", start),
             bigquery.ScalarQueryParameter("end", "DATE", end),
         ]
+        + filter_params
     )
     kpi = dict(list(client.query(q, job_config=job_config).result())[0].items())
 
@@ -362,6 +419,7 @@ def load_call_quality(start: dt.date, end: dt.date) -> dict:
     FROM `{TABLE}`
     WHERE day_update BETWEEN @start AND @end
       AND Thoi_gian_cuoc_goi_dau_tien IS NOT NULL
+      {filter_sql}
     GROUP BY 1
     """
     df_hist = client.query(q2, job_config=job_config).result().to_dataframe()
@@ -421,6 +479,17 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     start_date = end_date = date_range
 
+sale_options = load_sale_list(start_date, end_date)
+selected_sales_list = st.sidebar.multiselect(
+    "Lọc theo tên sale (chia lead)",
+    options=sale_options,
+    help=(
+        "Để trống = xem tất cả sale. Lọc theo Sale_Name_chia_lead — sale đã "
+        "nhận lead đúng lúc chia lead, dùng chung cho mọi biểu đồ."
+    ),
+)
+selected_sales = tuple(selected_sales_list) if selected_sales_list else None
+
 st.sidebar.caption(f"Dữ liệu snapshot có từ {mn_day} đến {mx_day}.")
 
 # --------------------------------------------------------------------------
@@ -432,7 +501,7 @@ render_header()
 # (de tab con lai dan chieu nguoc ve dung so lieu da nhac o Tong quan, giong
 # cach GEO lam - Tong quan la "muc luc", tab sau trich dan lai so cu roi moi
 # vao phan tich).
-kpi = load_kpi(start_date, end_date)
+kpi = load_kpi(start_date, end_date, selected_sales)
 
 tab_tong_quan, tab_diem_nghen, tab_sale, tab_call = st.tabs(
     [
@@ -508,7 +577,7 @@ with tab_diem_nghen:
 
     with col_left:
         st.markdown("**⏱ Thời gian trung vị mỗi chặng (phút)**")
-        df_time = load_stage_time(start_date, end_date)
+        df_time = load_stage_time(start_date, end_date, selected_sales)
         # Case nghi ngo: n qua nho (<10) hoac gia tri am (khong the co thoi
         # gian am) - thuong la do du lieu nguon (Metabase) chua day du /
         # sai lech, KHONG loc bo, chi to mau canh bao de de nhan biet.
@@ -542,7 +611,7 @@ with tab_diem_nghen:
 
     with col_right:
         st.markdown("**👥 Số UID theo trạng thái lead (Status_of_Lead)**")
-        df_vol = load_stage_volume(start_date, end_date)
+        df_vol = load_stage_volume(start_date, end_date, selected_sales)
         accent_cycle = [
             COLORS["red"]["accent"], COLORS["peach"]["accent"],
             COLORS["yellow"]["accent"], COLORS["green"]["accent"],
@@ -595,7 +664,7 @@ with tab_sale:
         unsafe_allow_html=True,
     )
 
-    df_sale = load_sale_performance(start_date, end_date)
+    df_sale = load_sale_performance(start_date, end_date, selected_sales)
 
     col_left, col_right = st.columns(2)
 
@@ -724,7 +793,7 @@ with tab_call:
         unsafe_allow_html=True,
     )
 
-    cq = load_call_quality(start_date, end_date)
+    cq = load_call_quality(start_date, end_date, selected_sales)
 
     row1 = st.columns(3)
     row1[0].metric(
